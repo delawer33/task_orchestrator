@@ -1,0 +1,155 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    build:
+      context: ./rabbitmq
+    image: heidiks/rabbitmq-delayed-message-exchange:latest
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-secret}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics -q check_running
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASS: ${RABBITMQ_PASS}
+      RABBITMQ_HOST: ${RABBITMQ_HOST}
+    volumes:
+      - ./api:/app/api_code # Монтируем локальную папку api в /app/api_code контейнера
+      - ./config:/app/config # Монтируем локальную папку config в /app/config контейнера
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASS: ${RABBITMQ_PASS}
+      RABBITMQ_HOST: ${RABBITMQ_HOST}
+    volumes:
+      - ./worker:/app/worker_code # Монтируем локальную папку worker в /app/worker_code контейнера
+      - ./config:/app/config # Монтируем локальную папку config в /app/config контейнера
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    deploy:
+      replicas: ${WORKER_REPLICAS:-4}
+    restart: unless-stopped
+    command: python -m worker_code.main --concurrency ${WORKER_CONCURRENCY:-4}
+
+  worker_rpc: # Новый сервис для RPC worker'а
+    build:
+      context: .
+      dockerfile: rpc_worker/Dockerfile # Используем новый Dockerfile
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASS: ${RABBITMQ_PASS}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY_RPC:-2} # Отдельная настройка concurrency
+    volumes:
+      - ./rpc_worker:/app/rpc_worker_code # Монтируем локальную папку
+      - ./config:/app/config # Монтируем конфиг
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    deploy:
+      replicas: 1 # Обычно достаточно 1-2 реплики для RPC
+    restart: unless-stopped
+    command: python -m rpc_worker_code.main --concurrency ${WORKER_CONCURRENCY_RPC:-2}
+
+  worker_urgent:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile # Используем тот же Dockerfile
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASS: ${RABBITMQ_PASS}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY_URGENT:-2} # Отдельная настройка concurrency для срочных
+    volumes:
+      - ./worker:/app/worker_code
+      - ./config:/app/config
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    deploy:
+      replicas: ${WORKER_REPLICAS_URGENT:-2}
+    restart: unless-stopped
+    command: python -m worker_code.main --queues urgent_tasks --concurrency ${WORKER_CONCURRENCY_URGENT:-2}
+
+  dlx_handler:
+    build:
+      context: .
+      dockerfile: dlx_handler/Dockerfile
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASS: ${RABBITMQ_PASS}
+      RABBITMQ_HOST: ${RABBITMQ_HOST}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    deploy:
+      replicas: ${DLX_REPLICAS:-2}
+    restart: unless-stopped
+    volumes:
+      - ./dlx_handler:/app/dlx_handler_code
+      - ./config:/app/config
+
+  # priority_manager:
+  #   build:
+  #     context: .
+  #     dockerfile: priority_manager/Dockerfile
+  #   environment:
+  #     APP_ENV: ${APP_ENV:-development}
+  #     RABBITMQ_USER: ${RABBITMQ_USER}
+  #     RABBITMQ_PASS: ${RABBITMQ_PASS}
+  #   depends_on:
+  #     rabbitmq:
+  #       condition: service_healthy
+  #   volumes:
+  #     - ./priority_manager:/app/priority_manager_code # Монтируем локальную папку
+  #     - ./config:/app/config # Монтируем конфиг
+  #   deploy:
+  #     replicas: 1
+  #   restart: unless-stopped
+
+  # dashboard:
+  #   build:
+  #     context: .
+  #     dockerfile: dashboard/Dockerfile
+  #   ports:
+  #     - "8080:8080"
+  #   environment:
+  #     APP_ENV: ${APP_ENV:-development}
+  #   depends_on:
+  #     api:
+  #       condition: service_started
+  #   restart: unless-stopped
+
+volumes:
+  rabbitmq_data:
