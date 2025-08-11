@@ -4,12 +4,22 @@ import uuid
 import aio_pika
 import asyncio
 import logging
-from fastapi import FastAPI, status, HTTPException
+from fastapi import FastAPI, status, HTTPException, Depends
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
-from config.utils.rabbit import get_rabbit_connection, get_rabbit_channel
+from typing import AsyncGenerator, Optional, List
+from config.utils.rabbit import (
+    get_rabbit_connection,
+    get_rabbit_channel,
+    setup_queues
+)
 from config.settings import get_settings
+from config.db.base import get_async_db_session
+from config.db.models import Task as DBTask
+from sqlalchemy.future import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from uuid import UUID
+from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,82 +38,82 @@ class TaskBase(BaseModel):
     parameters: dict = {}
 
 
+class TaskResponse(TaskBase):
+    id: UUID
+    task_type: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    retry_count: int
+    result: Optional[dict] = None
+
+    class Config:
+        from_attributes = True
+
+
 class DelayedTaskRequest(TaskRequest):
     delay_seconds: int = 0
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with get_rabbit_channel() as channel:
-        exchange = await channel.declare_exchange(
-            "orchestrator_exchange",
-            type="x-delayed-message",
-            arguments={
-                "x-delayed-type": aio_pika.ExchangeType.DIRECT
-            },
-            durable=True
-        )
-        cpu_queue = await channel.declare_queue(
-            "cpu_intensive_tasks",
-            durable=True,
-            arguments={
-                "x-max-priority": 10,
-                "x-dead-letter-exchange": "dlx_exchange",
-                "x-single-active-consumer": True,
-            },
-        )
-        await cpu_queue.bind(exchange, routing_key="cpu_intensive_tasks")
-        io_queue = await channel.declare_queue(
-            "io_bound_tasks",
-            durable=True,
-            arguments={
-                "x-max-priority": 10,
-                "x-dead-letter-exchange": "dlx_exchange",
-                "x-max-length": 10000,
-            },
-        )
-        await io_queue.bind(exchange, routing_key="io_bound_tasks")
-        rpc_queue = await channel.declare_queue("rpc_requests", durable=True)
-        await rpc_queue.bind(exchange, routing_key="rpc_requests")
-
-        await channel.declare_exchange(
-            "dlx_exchange", type=aio_pika.ExchangeType.FANOUT, durable=True
-        )
-        dlx_queue = await channel.declare_queue(
-            "dead_letter_queue", durable=True
-        )
-
-        await dlx_queue.bind("dlx_exchange")
+    await setup_queues()
     yield
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-@app.post("/cpu_intensive_task", description="Fibonacci")
-async def create_cpu_task(request: TaskRequest):
-    return await _publish_task_to_rabbitmq(request, "cpu")
+@app.post("/cpu_intensive_task", description="Fibonacci", response_model=TaskResponse)
+async def create_cpu_task(request: TaskRequest, db: AsyncSession = Depends(get_async_db_session)):
+    return await _publish_task_to_rabbitmq(request, "cpu", db=db)
 
 
-@app.post("/io_bound_task", status_code=status.HTTP_202_ACCEPTED)
-async def create_task(request: TaskRequest):
-    return await _publish_task_to_rabbitmq(request, "io")
+@app.post("/io_bound_task", status_code=status.HTTP_202_ACCEPTED, response_model=TaskResponse)
+async def create_task(request: TaskRequest, db: AsyncSession = Depends(get_async_db_session)):
+    return await _publish_task_to_rabbitmq(request, "io", db=db)
 
 
-@app.post("/delayed_cpu_intensive_task", status_code=status.HTTP_202_ACCEPTED)
-async def create_delayed_task(request: DelayedTaskRequest):
+@app.post("/delayed_cpu_intensive_task", status_code=status.HTTP_202_ACCEPTED, response_model=TaskResponse)
+async def create_delayed_task(request: DelayedTaskRequest, db: AsyncSession = Depends(get_async_db_session)):
     return await _publish_task_to_rabbitmq(
-        request, delay_seconds=request.delay_seconds
+        request, delay_seconds=request.delay_seconds, db=db
     )
 
 
 async def _publish_task_to_rabbitmq(
-    request: TaskRequest, task_type: str = None, delay_seconds: int = 0
+    request: TaskRequest, task_type: str = None, delay_seconds: int = 0, db: AsyncSession = Depends(get_async_db_session)
 ):
+    task_uuid = uuid.uuid4()
+    task_id_str = str(task_uuid)
+
+    db_task = DBTask(
+        id=task_uuid,
+        task_type=request.task_type,
+        parameters=request.parameters,
+        priority=request.priority,
+        is_urgent=request.is_urgent,
+        status="queued",
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc)
+    )
+
+    try:
+        db.add(db_task)
+        await db.commit()
+        await db.refresh(db_task)
+        logger.info(f"Task {task_id_str} saved to DB with status 'queued'.")
+    except Exception as e:
+        logger.error(f"Failed to save task {task_id_str} to DB: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save task to database")
+
     async with get_rabbit_channel() as channel:
-        task = {
+        task_message = {
             "type": request.task_type,
-            "task_id": str(uuid.uuid4()),
+            "task_id": task_id_str,
             "status": "queued",
             "priority": request.priority,
             "parameters": request.parameters,
@@ -118,7 +128,7 @@ async def _publish_task_to_rabbitmq(
             elif task_type == "io":
                 routing_key = "io_bound_tasks"
         message = aio_pika.Message(
-            body=json.dumps(task).encode(),
+            body=json.dumps(task_message).encode(),
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
             priority=request.priority,
         )
@@ -129,12 +139,13 @@ async def _publish_task_to_rabbitmq(
             await exchange.publish(message, routing_key="cpu_intensive_tasks")
             
             logger.info(
-                f"Published delayed task {task['task_id']} with delay {delay_seconds}s to delayed_tasks_queue"
+                f"Published delayed task {task_id_str} with delay {delay_seconds}s to delayed_tasks_queue"
             )
         else:
             await exchange.publish(message, routing_key=routing_key)
-            logger.info(f"Published task {task['task_id']} to {routing_key}")
-        return {"task_id": task["task_id"], "status": "queued"}
+            logger.info(f"Published task {task_id_str} to {routing_key}")
+        
+        return db_task
 
 
 @app.post("/rpc_multiply", status_code=status.HTTP_200_OK)
@@ -196,3 +207,29 @@ async def rpc_multiply(request: TaskRequest):
         finally:
             await reply_queue.cancel(consumer_tag)
             await channel.close()
+
+
+@app.get("/tasks/{task_id}", response_model=TaskResponse)
+async def get_task_status(task_id: UUID, db: AsyncSession = Depends(get_async_db_session)):
+    result = await db.execute(select(DBTask).where(DBTask.id == task_id))
+    task = result.scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+@app.get("/tasks", response_model=List[TaskResponse])
+async def list_tasks(
+    status: Optional[str] = None,
+    task_type: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_async_db_session)
+):
+    query = select(DBTask)
+    if status:
+        query = query.where(DBTask.status == status)
+    if task_type:
+        query = query.where(DBTask.task_type == task_type)
+        
+    tasks = (await db.execute(query.offset(skip).limit(limit))).scalars().all()
+    return tasks

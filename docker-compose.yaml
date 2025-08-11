@@ -20,6 +20,17 @@ services:
       timeout: 5s
       retries: 5
 
+  postgres:
+    image: postgres:16-alpine
+    volumes:
+      - ./var/db:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+    environment:
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_DB=${DB_NAME}
+
   api:
     build:
       context: .
@@ -37,6 +48,8 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+      postgres:
+        condition: service_started
     restart: unless-stopped
 
   worker:
@@ -54,6 +67,8 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+      postgres:
+        condition: service_started
     deploy:
       replicas: ${WORKER_REPLICAS:-4}
     restart: unless-stopped
@@ -75,6 +90,8 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+      postgres:
+        condition: service_started
     deploy:
       replicas: 1 # Обычно достаточно 1-2 реплики для RPC
     restart: unless-stopped
@@ -96,6 +113,8 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+      postgres:
+        condition: service_started
     deploy:
       replicas: ${WORKER_REPLICAS_URGENT:-2}
     restart: unless-stopped
@@ -113,6 +132,8 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+      postgres:
+        condition: service_started
     deploy:
       replicas: ${DLX_REPLICAS:-2}
     restart: unless-stopped

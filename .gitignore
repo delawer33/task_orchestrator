@@ -1,3 +1,5 @@
 .env
 .vscode
 .venv
+priority_manager/
+var/

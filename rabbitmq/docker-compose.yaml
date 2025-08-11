@@ -1,0 +1,23 @@
+services:
+  rabbitmq:
+    build:
+      context: .
+    image: heidiks/rabbitmq-delayed-message-exchange:latest
+    container_name: rabbitmq-to
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-secret}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics -q check_running
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+volumes:
+  rabbitmq_data:

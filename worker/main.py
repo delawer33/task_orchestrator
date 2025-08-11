@@ -6,8 +6,16 @@ import argparse
 import logging
 from concurrent.futures import ProcessPoolExecutor
 from config.settings import get_settings
-from config.utils.rabbit import get_rabbit_connection
+from config.utils.rabbit import get_rabbit_connection, setup_queues
 from task_processor import process_task
+
+from config.db.base import get_async_db_session
+from config.db.models import Task as DBTask
+from sqlalchemy.future import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from uuid import UUID
+from datetime import datetime, timezone
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,71 +27,6 @@ PREFETCH_MAP = {
     "io_bound_tasks": 50,
     "urgent_tasks": 5,
 }
-
-
-async def setup_queues(channel: aio_pika.abc.AbstractChannel):
-    # exchange = await channel.declare_exchange(
-    #     "orchestrator_exchange", aio_pika.ExchangeType.DIRECT, durable=True
-    # )
-    exchange = await channel.declare_exchange(
-            "orchestrator_exchange",
-            type="x-delayed-message",
-            arguments={
-                "x-delayed-type": aio_pika.ExchangeType.DIRECT
-            },
-            durable=True
-        )
-    cpu_queue = await channel.declare_queue(
-        "cpu_intensive_tasks",
-        durable=True,
-        arguments={
-            "x-max-priority": 10,
-            "x-dead-letter-exchange": "dlx_exchange",
-            "x-single-active-consumer": True,
-        },
-    )
-    await cpu_queue.bind(exchange, routing_key="cpu_intensive_tasks")
-    io_queue = await channel.declare_queue(
-        "io_bound_tasks",
-        durable=True,
-        arguments={
-            "x-max-priority": 10,
-            "x-dead-letter-exchange": "dlx_exchange",
-            "x-max-length": 10000,
-        },
-    )
-    await io_queue.bind(exchange, routing_key="io_bound_tasks")
-    urgent_queue = await channel.declare_queue(
-        "urgent_tasks",
-        durable=True,
-        arguments={
-            "x-max-priority": 10,
-            "x-dead-letter-exchange": "dlx_exchange",
-        },
-    )
-    await urgent_queue.bind(exchange, routing_key="urgent_tasks")
-    dlx_exchange = await channel.declare_exchange(
-        "dlx_exchange", aio_pika.ExchangeType.FANOUT, durable=True
-    )
-    delayed_queue = await channel.declare_queue(
-        "delayed_tasks_queue",
-        durable=True,
-        arguments={
-            "x-dead-letter-exchange": "orchestrator_exchange",
-            "x-dead-letter-routing-key": "io_bound_tasks",
-        },
-    )
-    await delayed_queue.bind(exchange, routing_key="delayed_tasks")
-
-    dlx_queue = await channel.declare_queue("dead_letter_queue", durable=True)
-    await dlx_queue.bind(dlx_exchange)
-    return {
-        "exchange": exchange,
-        "cpu_queue": cpu_queue,
-        "io_queue": io_queue,
-        "urgent_queue": urgent_queue,
-        "delayed_queue": delayed_queue,
-    }
 
 
 async def process_cpu_task(task: dict) -> dict:
@@ -101,44 +44,96 @@ async def process_message(
     semaphore: asyncio.Semaphore,
     queue_name: str,
 ):
-    print("!!!!!!!!!!!!!!!!!!!!!111")
     async with semaphore:
+        task_data = None
+        task_id_uuid = None
         try:
             async with message.process(requeue=False):
-                task = json.loads(message.body.decode())
-                logger.info(f"Processing task: {task['task_id']}")
+                task_data = json.loads(message.body.decode())
+                task_id_str = task_data.get("task_id")
+                if not task_id_str:
+                    logger.error(f"Received message without task_id: {task_data}")
+                    return
+                
                 try:
-                    task = json.loads(message.body.decode())
-                    logger.info(
-                        f"Processing {task['task_id']} from {queue_name}"
-                    )
+                    task_id_uuid = UUID(task_id_str)
+                except ValueError:
+                    logger.error(f"Invalid UUID received for task_id: {task_id_str}")
+                    return
+
+                logger.info(f"Processing {task_id_str} from {queue_name}")
+
+                async for session in get_async_db_session():
+                    db_task = await session.get(DBTask, task_id_uuid)
+                    if db_task:
+                        db_task.status = "processing"
+                        db_task.started_at = datetime.now(timezone.utc)
+                        db_task.updated_at = datetime.now(timezone.utc)
+                        session.add(db_task)
+                        await session.commit()
+                        await session.refresh(db_task)
+                    else:
+                        logger.warning(f"Task {task_id_str} not found in DB during processing start.")
+
+                result = None
+                try:
                     if queue_name == "cpu_intensive_tasks":
                         result = await asyncio.wait_for(
-                            process_cpu_task(task), timeout=300.0
+                            process_cpu_task(task_data), timeout=300.0
                         )
                     elif queue_name == "io_bound_tasks":
-                        result = await process_io_task(task)
+                        result = await process_io_task(task_data)
                     else:
                         result = await asyncio.wait_for(
-                            process_io_task(task), timeout=30.0
+                            process_io_task(task_data), timeout=30.0
                         )
-                    logger.info(f"Task completed: {task['task_id']}")
+                    logger.info(f"Task completed: {task_id_str}")
+
+                    async for session in get_async_db_session():
+                        db_task = await session.get(DBTask, task_id_uuid)
+                        if db_task:
+                            db_task.status = "completed"
+                            db_task.completed_at = datetime.now(timezone.utc)
+                            db_task.updated_at = datetime.now(timezone.utc)
+                            db_task.result = result
+                            session.add(db_task)
+                            await session.commit()
+                            await session.refresh(db_task)
+
                 except asyncio.TimeoutError:
-                    logger.error(f"Task timed out: {task['task_id']}")
+                    logger.error(f"Task timed out: {task_id_str}")
+                    async for session in get_async_db_session():
+                        db_task = await session.get(DBTask, task_id_uuid)
+                        if db_task:
+                            db_task.status = "failed"
+                            db_task.error_message = "Task timed out."
+                            db_task.updated_at = datetime.now(timezone.utc)
+                            session.add(db_task)
+                            await session.commit()
+                            await session.refresh(db_task)
                     await message.reject(requeue=False)
+
                 except Exception as e:
                     logger.error(
-                        f"Task failed: {task['task_id']}, error: {str(e)}"
+                        f"Task failed: {task_id_str}, error: {str(e)}"
                     )
-                    if "metadata" not in task:
-                        task["metadata"] = {}
-                    task["metadata"]["retry_count"] = (
-                        task["metadata"].get("retry_count", 0) + 1
-                    )
-                    updated_message_body = json.dumps(task).encode()
+                    async for session in get_async_db_session():
+                        db_task = await session.get(DBTask, task_id_uuid)
+                        if db_task:
+                            db_task.status = "failed"
+                            db_task.error_message = str(e)
+                            db_task.updated_at = datetime.now(timezone.utc)
+                            task_data_metadata = task_data.get("metadata", {})
+                            db_task.retry_count = task_data_metadata.get("retry_count", 0) + 1
+                            session.add(db_task)
+                            await session.commit()
+                            await session.refresh(db_task)
                     await message.reject(requeue=False)
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON in message: {message.body.decode()}")
+            pass
         except Exception as e:
-            logger.error(f"Message processing error: {str(e)}")
+            logger.error(f"Message processing error outside task logic: {str(e)} - Task data: {task_data}")
 
 
 async def consume_queues(
@@ -147,12 +142,11 @@ async def consume_queues(
     concurrency_settings: dict,
 ):
     PREFETCH_CONFIG = {
-        "cpu_intensive_tasks": 1,
+        "cpu_intensive_tasks": concurrency_settings.get("cpu_intensive_tasks", 1),
         "io_bound_tasks": 50,
         "urgent_tasks": 5,
     }
-    channel = await connection.channel()
-    await setup_queues(channel)
+    await setup_queues()
     async with connection:
         consumers = []
         for queue_name in queues_to_consume:

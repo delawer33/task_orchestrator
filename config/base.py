@@ -6,10 +6,18 @@ class BaseConfig(BaseSettings):
     APP_NAME: str = "Task Orchestrator"
     DEBUG: bool = False
     LOG_LEVEL: str = "INFO"
+
     RABBITMQ_HOST: str = "rabbitmq"
     RABBITMQ_PORT: int = 5672
-    RABBITMQ_USER: str = Field(..., env="RABBITMQ_USER")
-    RABBITMQ_PASS: str = Field(..., env="RABBITMQ_PASS")
+    RABBITMQ_USER: str = Field("admin", env="RABBITMQ_USER")
+    RABBITMQ_PASS: str = Field("secret", env="RABBITMQ_PASS")
+
+    DB_USER: str = "postgres"
+    DB_PASSWORD: str = "postgres"
+    DB_HOST: str = "postgres"
+    DB_PORT: int = 5432
+    DB_NAME: str = "task_orchestrator"
+    
     RABBITMQ_VHOST: str = "/"
     DEFAULT_QUEUE: str = "default_tasks"
     PRIORITY_QUEUE: str = "urgent_tasks"
